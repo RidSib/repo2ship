@@ -1,0 +1,10 @@
+{
+  "verify": "npm run verify",
+  "verifyFull": "npm run verify:full",
+  "uiPaths": ["public/", "tests/e2e/"],
+  "start": "npm run dev",
+  "url": "http://127.0.0.1:4173",
+  "readyTimeoutSeconds": 30,
+  "protectedPaths": ["tsconfig.json", "vitest.config.ts", "playwright.config.ts"],
+  "screenshotPath": ".pi/artifacts/ui-verify.png"
+}

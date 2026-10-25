@@ -1,0 +1,16 @@
+# Protected Policy, CI, Test Runner & Dependency Paths
+# When Branch Protection has "Require review from Code Owners" enabled,
+# any PR touching these paths cannot auto-merge without human owner approval.
+# Template users: replace @RidSib with your own GitHub user or team.
+
+/.github/                @RidSib
+/scripts/agent/          @RidSib
+/.pi/pipeline.json       @RidSib
+/AGENTS.md               @RidSib
+/CLAUDE.md               @RidSib
+/package.json            @RidSib
+/package-lock.json       @RidSib
+/tsconfig.json           @RidSib
+/vitest.config.ts        @RidSib
+/playwright.config.ts    @RidSib
+/tests/                  @RidSib

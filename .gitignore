@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.pi/sessions/
+.pi/artifacts/
+.pi/qa/
+.pi/agent/
+playwright-report/
+test-results/
+.env*
+!.env.example
+.aws/
+.claude/
+*.log
+.DS_Store

@@ -1,0 +1,1040 @@
+name: "Repo2Ship (Pi / OpenCode)"
+
+on:
+  issues:
+    types: [labeled]
+  issue_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Optional GitHub Issue number to solve"
+        required: false
+        type: string
+      verify_pr:
+        description: "Optional Pull Request number to run ONLY the Verifier Agent on"
+        required: false
+        type: string
+      fix_pr:
+        description: "Optional Pull Request number for bounded Verifier fix round"
+        required: false
+        type: string
+      task_prompt:
+        description: "Direct task prompt (if not targeting an issue)"
+        required: false
+        type: string
+      model:
+        description: "Implementer model or deployment (empty = repository model settings)"
+        required: false
+        default: ""
+        type: string
+
+jobs:
+  # ==========================================================================
+  # JOB 0: Stage 2 Refinement Agent (Strategist Role, Read-Only Repo Token)
+  # - Runs on issue triggers only (skips PR comments/reviews and raw prompts)
+  # - Uses Strategist model with read-only tools (--tools read,grep,find,ls)
+  # - Produces .pi/artifacts/refinement.json + .pi/artifacts/refinement-comment.md
+  # ==========================================================================
+  refine:
+    name: "Job 0: Refinement Agent (Strategist)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: pi-agent-refine-${{ github.event.issue.number || inputs.issue_number || github.run_id }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      issues: read
+    # Kill switch: set the repo variable AGENT_ENABLED=false to stop every model-running job
+    if: >
+      vars.AGENT_ENABLED != 'false' &&
+      ((github.event_name == 'issues' && github.event.label.name == 'agent') ||
+       (github.event_name == 'issue_comment' &&
+         github.event.issue.pull_request == null &&
+         github.event.comment.user.type != 'Bot' &&
+         (contains(github.event.comment.body, '@pi') || contains(github.event.comment.body, '@agent'))) ||
+       (github.event_name == 'workflow_dispatch' && inputs.issue_number != ''))
+    outputs:
+      issue_number: ${{ steps.refine_intake.outputs.issue_number }}
+      status: ${{ steps.refine_run.outputs.status }}
+
+    steps:
+      - name: Verify trigger user has collaborator write permission
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TRIGGER_USER: ${{ github.actor }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && "$TRIGGER_USER" == *"[bot]" ]]; then
+            echo "Triggered via workflow_dispatch by authenticated bot '${TRIGGER_USER}'; allowed."
+            exit 0
+          fi
+          PERM="$(gh api "repos/${GITHUB_REPOSITORY}/collaborators/${TRIGGER_USER}/permission" --jq '.permission')"
+          echo "Trigger user '${TRIGGER_USER}' permission: ${PERM}"
+          if [[ "$PERM" != "admin" && "$PERM" != "maintain" && "$PERM" != "write" ]]; then
+            echo "::error::User ${TRIGGER_USER} does not have write access to trigger the coding agent."
+            exit 1
+          fi
+
+      - name: Checkout repository (no persisted credentials)
+        uses: actions/checkout@v7
+        with:
+          # Always start from main: on PR-review triggers the default ref is the PR merge commit
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node.js 24 with npm cache
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Fetch issue thread for refinement
+        id: refine_intake
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_ISSUE_NUM: ${{ github.event.issue.number }}
+          INPUT_ISSUE: ${{ inputs.issue_number }}
+        run: |
+          mkdir -p .pi/artifacts .pi/sessions
+          ISSUE_NUM="${EVENT_ISSUE_NUM:-$INPUT_ISSUE}"
+          echo "issue_number=${ISSUE_NUM}" >> "$GITHUB_OUTPUT"
+
+          gh issue view "$ISSUE_NUM" --json number,title,body,comments --jq '
+            "# Issue #\(.number): \(.title)\n\n\(.body)\n"
+            + (.comments | map("\n---\n@\(.author.login) commented:\n\(.body)\n") | join(""))' > .pi/artifacts/task-prompt.txt
+
+      - name: Run Strategist Refinement Agent
+        id: refine_run
+        env:
+          AZURE_OPENAI_BASE_URL: ${{ secrets.AZURE_OPENAI_BASE_URL }}
+          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          # Leave unset to detect legacy Azure endpoints; generic endpoints are the default.
+          MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER || '' }}
+          MODEL_BASE_URL: ${{ secrets.MODEL_BASE_URL || vars.MODEL_BASE_URL || '' }}
+          MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
+          MODEL_COMPAT: ${{ vars.MODEL_COMPAT || '' }}
+          AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+          AWS_BEARER_TOKEN_BEDROCK: ${{ secrets.AWS_BEARER_TOKEN_BEDROCK }}
+          # Agent engine per role: "pi" (default) or "opencode" (see scripts/agent/harness.mjs)
+          IMPLEMENTER_ENGINE: ${{ vars.IMPLEMENTER_ENGINE || vars.AGENT_ENGINE || 'pi' }}
+          STRATEGIST_ENGINE: ${{ vars.STRATEGIST_ENGINE || vars.AGENT_ENGINE || 'pi' }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL || vars.OPENAI_BASE_URL || '' }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          IMPLEMENTER_MODEL: ${{ inputs.model || vars.IMPLEMENTER_MODEL || '' }}
+          IMPLEMENTER_API: ${{ vars.IMPLEMENTER_API || '' }}
+          STRATEGIST_MODEL: ${{ vars.STRATEGIST_MODEL || '' }}
+          STRATEGIST_API: ${{ vars.STRATEGIST_API || '' }}
+          AZURE_OPENAI_MODEL: ${{ vars.AZURE_OPENAI_MODEL || '' }}
+          AZURE_OPENAI_API: ${{ vars.AZURE_OPENAI_API || '' }}
+          AZURE_MODEL_COMPAT: ${{ vars.AZURE_MODEL_COMPAT || '' }}
+          PI_THINKING_LEVEL: ${{ vars.PI_THINKING_LEVEL || 'high' }}
+          MODEL_COST_INPUT_PER_1M: ${{ vars.MODEL_COST_INPUT_PER_1M || '' }}
+          MODEL_COST_OUTPUT_PER_1M: ${{ vars.MODEL_COST_OUTPUT_PER_1M || '' }}
+          MODEL_COST_CACHE_READ_PER_1M: ${{ vars.MODEL_COST_CACHE_READ_PER_1M || '' }}
+          MODEL_COST_CACHE_WRITE_PER_1M: ${{ vars.MODEL_COST_CACHE_WRITE_PER_1M || '' }}
+          AZURE_COST_INPUT_PER_1M: ${{ vars.AZURE_COST_INPUT_PER_1M || '' }}
+          AZURE_COST_OUTPUT_PER_1M: ${{ vars.AZURE_COST_OUTPUT_PER_1M || '' }}
+          AZURE_COST_CACHE_READ_PER_1M: ${{ vars.AZURE_COST_CACHE_READ_PER_1M || '' }}
+        run: node scripts/agent/refinement.mjs
+
+      - name: Ship Refinement Session to Langfuse (Non-Blocking)
+        if: always()
+        continue-on-error: true
+        env:
+          MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER || '' }}
+          LANGFUSE_BASE_URL: ${{ secrets.LANGFUSE_BASE_URL || vars.LANGFUSE_BASE_URL || 'https://cloud.langfuse.com' }}
+          LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+          LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+          IMPLEMENTER_MODEL: ${{ inputs.model || vars.IMPLEMENTER_MODEL || '' }}
+          IMPLEMENTER_API: ${{ vars.IMPLEMENTER_API || '' }}
+          STRATEGIST_MODEL: ${{ vars.STRATEGIST_MODEL || '' }}
+          STRATEGIST_API: ${{ vars.STRATEGIST_API || '' }}
+          AZURE_OPENAI_MODEL: ${{ vars.AZURE_OPENAI_MODEL || '' }}
+          AZURE_OPENAI_API: ${{ vars.AZURE_OPENAI_API || '' }}
+          ISSUE_NUM: ${{ steps.refine_intake.outputs.issue_number }}
+          LANGFUSE_TAG: "refinement"
+          LANGFUSE_TRACE_NAME: "pi-refine #${{ steps.refine_intake.outputs.issue_number }}"
+        run: node scripts/agent/push-trace-to-langfuse.mjs
+
+      - name: Upload Refinement Artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pi-refine-bundle-${{ github.run_id }}
+          path: |
+            .pi/artifacts/
+            .pi/sessions/
+          if-no-files-found: ignore
+
+  # ==========================================================================
+  # JOB 1: Sandboxed Agent & Local Verification (Read-Only Repo Token)
+  # - persist-credentials: false so .git/config holds no token
+  # - Only secret exposed to the agent step is the model API key (Azure or OpenAI-compatible)
+  # - Produces .pi/artifacts/changes.patch + telemetry artifacts
+  # ==========================================================================
+  agent:
+    name: "Job 1: Sandboxed Agent & Local Verification"
+    needs: [refine]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    concurrency:
+      group: pi-agent-run-${{ github.event.issue.number || github.event.pull_request.number || inputs.issue_number || inputs.fix_pr || github.run_id }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    if: >
+      !cancelled() &&
+      vars.AGENT_ENABLED != 'false' &&
+      (needs.refine.result == 'skipped' ||
+       (needs.refine.result == 'success' && needs.refine.outputs.status == 'ready')) &&
+      ((github.event_name == 'workflow_dispatch' && inputs.verify_pr == '') ||
+       (github.event_name == 'issues' && github.event.label.name == 'agent') ||
+       (github.event_name == 'issue_comment' &&
+         github.event.comment.user.type != 'Bot' &&
+         (contains(github.event.comment.body, '@pi') || contains(github.event.comment.body, '@agent'))) ||
+       (github.event_name == 'pull_request_review' &&
+         github.event.review.user.type != 'Bot' &&
+         startsWith(github.event.pull_request.head.ref, 'agent/') &&
+         (github.event.review.state == 'changes_requested' || contains(github.event.review.body, '@pi') || contains(github.event.review.body, '@agent'))))
+    outputs:
+      issue_number: ${{ steps.intake.outputs.issue_number }}
+      branch_name: ${{ steps.intake.outputs.branch_name }}
+      base_sha: ${{ steps.intake.outputs.base_sha }}
+      rebase_failed: ${{ steps.intake.outputs.rebase_failed }}
+      clarification_needed: ${{ steps.agent_run.outputs.clarification_needed }}
+      has_patch: ${{ steps.export_patch.outputs.has_patch }}
+
+    steps:
+      - name: Verify trigger user has collaborator write permission
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TRIGGER_USER: ${{ github.actor }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && "$TRIGGER_USER" == *"[bot]" ]]; then
+            echo "Triggered via workflow_dispatch by authenticated bot '${TRIGGER_USER}'; allowed."
+            exit 0
+          fi
+          PERM="$(gh api "repos/${GITHUB_REPOSITORY}/collaborators/${TRIGGER_USER}/permission" --jq '.permission')"
+          echo "Trigger user '${TRIGGER_USER}' permission: ${PERM}"
+          if [[ "$PERM" != "admin" && "$PERM" != "maintain" && "$PERM" != "write" ]]; then
+            echo "::error::User ${TRIGGER_USER} does not have write access to trigger the coding agent."
+            exit 1
+          fi
+
+      - name: Checkout repository (no persisted credentials)
+        uses: actions/checkout@v7
+        with:
+          # Always start from main: on PR-review triggers the default ref is the PR merge commit
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node.js 24 with npm cache
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Cache & Install Playwright Chromium
+        uses: actions/cache@v6
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('package-lock.json') }}
+
+      - name: Ensure Playwright Chromium is installed
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: npx playwright install --with-deps chromium
+
+      - name: Install Playwright OS dependencies (when cached)
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: npx playwright install-deps chromium
+
+      - name: Prepare target branch & assemble task prompt (Step 1 Intake)
+        id: intake
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ISSUE_NUM: ${{ github.event.issue.number }}
+          EVENT_PR_NUM: ${{ github.event.pull_request.number }}
+          EVENT_PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          EVENT_IS_PR_COMMENT: ${{ github.event.issue.pull_request.url }}
+          RUN_ID: ${{ github.run_id }}
+          INPUT_ISSUE: ${{ inputs.issue_number }}
+          INPUT_FIX_PR: ${{ inputs.fix_pr }}
+          INPUT_PROMPT: ${{ inputs.task_prompt }}
+        run: |
+          mkdir -p .pi/artifacts
+          # Pipeline scripts always run from main, never from the (agent or human) PR branch
+          rm -rf /tmp/agent-scripts && mkdir -p /tmp/agent-scripts
+          git archive origin/main scripts/agent | tar -x -C /tmp/agent-scripts --strip-components=2
+          ISSUE_NUM=""
+          PR_TARGET_NUM=""
+          BRANCH_NAME=""
+
+          if [ "$EVENT_NAME" = "issues" ]; then
+            ISSUE_NUM="$EVENT_ISSUE_NUM"
+            BRANCH_NAME="agent/issue-${ISSUE_NUM}"
+          elif [ "$EVENT_NAME" = "issue_comment" ]; then
+            ISSUE_NUM="$EVENT_ISSUE_NUM"
+            if [ -n "$EVENT_IS_PR_COMMENT" ]; then
+              PR_TARGET_NUM="$EVENT_ISSUE_NUM"
+              BRANCH_NAME="$(gh pr view "$PR_TARGET_NUM" --json headRefName --jq '.headRefName')"
+            else
+              BRANCH_NAME="agent/issue-${ISSUE_NUM}"
+            fi
+          elif [ "$EVENT_NAME" = "pull_request_review" ]; then
+            PR_TARGET_NUM="$EVENT_PR_NUM"
+            ISSUE_NUM="$EVENT_PR_NUM"
+            BRANCH_NAME="$EVENT_PR_HEAD_REF"
+          elif [ -n "$INPUT_FIX_PR" ]; then
+            PR_TARGET_NUM="$INPUT_FIX_PR"
+            ISSUE_NUM="$INPUT_FIX_PR"
+            BRANCH_NAME="$(gh pr view "$INPUT_FIX_PR" --json headRefName --jq '.headRefName')"
+          elif [ -n "$INPUT_ISSUE" ]; then
+            ISSUE_NUM="$INPUT_ISSUE"
+            BRANCH_NAME="agent/issue-${ISSUE_NUM}"
+          else
+            ISSUE_NUM="manual-${RUN_ID}"
+            BRANCH_NAME="agent/task-${RUN_ID}"
+          fi
+
+          if [[ "$BRANCH_NAME" =~ ^agent/issue-([0-9]+)$ ]]; then
+            ISSUE_NUM="${BASH_REMATCH[1]}"
+          fi
+
+          # Only ever work on agent-owned branches (never rewrite a human's PR branch)
+          case "$BRANCH_NAME" in
+            agent/*) ;;
+            *)
+              echo "::error::Refusing to run on non-agent branch '${BRANCH_NAME}'. @pi only works on agent/* branches."
+              exit 1
+              ;;
+          esac
+          if [ -n "$PR_TARGET_NUM" ] && \
+             [ "$(gh pr view "$PR_TARGET_NUM" --json isCrossRepository --jq '.isCrossRepository')" != "false" ]; then
+            echo "::error::Refusing to run on PR #${PR_TARGET_NUM}: it comes from a fork."
+            exit 1
+          fi
+
+          echo "issue_number=${ISSUE_NUM}" >> "$GITHUB_OUTPUT"
+          echo "branch_name=${BRANCH_NAME}" >> "$GITHUB_OUTPUT"
+
+          git config user.name "pi-coding-agent[bot]"
+          git config user.email "pi-coding-agent[bot]@users.noreply.github.com"
+
+          # Credentials are not persisted, so use the refs fetched by checkout (fetch-depth: 0)
+          # instead of talking to the remote. Record the remote SHA as the push lease.
+          if git rev-parse --verify --quiet "refs/remotes/origin/${BRANCH_NAME}" >/dev/null; then
+            echo "base_sha=$(git rev-parse "refs/remotes/origin/${BRANCH_NAME}")" >> "$GITHUB_OUTPUT"
+            git checkout -B "$BRANCH_NAME" "origin/$BRANCH_NAME"
+            if ! git rebase origin/main; then
+              git rebase --abort || true
+              cat <<EOF > .pi/artifacts/rebase-failed.md
+          ### Rebase Conflict Detected
+          The branch \`${BRANCH_NAME}\` could not be cleanly rebased onto \`origin/main\`.
+          Stopping the agent run to avoid overwriting changes on a stale base. Please rebase \`${BRANCH_NAME}\` onto \`main\` manually and re-trigger \`@pi\`.
+          EOF
+              echo "rebase_failed=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          else
+            echo "base_sha=" >> "$GITHUB_OUTPUT"
+            git checkout -B "$BRANCH_NAME" origin/main
+          fi
+
+          echo "rebase_failed=false" >> "$GITHUB_OUTPUT"
+
+          PROMPT_FILE=".pi/artifacts/task-prompt.txt"
+          if [ -n "$INPUT_PROMPT" ]; then
+            printf "%s\n" "$INPUT_PROMPT" > "$PROMPT_FILE"
+          elif [ -n "$PR_TARGET_NUM" ]; then
+            gh pr view "$PR_TARGET_NUM" --json number,title,body,comments,reviews --jq '
+              "# Pull request #\(.number): \(.title)\n\n\(.body)\n"
+              + (.comments | map("\n---\n@\(.author.login) commented:\n\(.body)\n") | join(""))
+              + (.reviews | map(select(.body != "") | "\n---\n@\(.author.login) reviewed (\(.state)):\n\(.body)\n") | join(""))' > "$PROMPT_FILE"
+            gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_TARGET_NUM}/comments" --paginate --jq '
+              .[] | "\n---\n@\(.user.login) on `\(.path)`:\n\(.body)\n"' >> "$PROMPT_FILE"
+            if [[ "$ISSUE_NUM" =~ ^[0-9]+$ ]] && [ "$ISSUE_NUM" != "$PR_TARGET_NUM" ]; then
+              gh issue view "$ISSUE_NUM" --json number,title,body,comments --jq '
+                "\n---\n# Linked Issue #\(.number): \(.title)\n\n\(.body)\n"
+                + (.comments | map("\n---\n@\(.author.login) commented on issue:\n\(.body)\n") | join(""))' >> "$PROMPT_FILE" 2>/dev/null || true
+            fi
+            if [ -n "$INPUT_FIX_PR" ]; then
+              PROMPT_FILE="$PROMPT_FILE" INPUT_FIX_PR="$INPUT_FIX_PR" node /tmp/agent-scripts/verification.mjs --prepare-fix-prompt
+            fi
+          elif [[ "$ISSUE_NUM" =~ ^[0-9]+$ ]]; then
+            # Use --json: in non-interactive mode `gh issue view --comments` prints only the
+            # comments, so the issue title and body never reached the agent.
+            gh issue view "$ISSUE_NUM" --json number,title,body,comments --jq '
+              "# Issue #\(.number): \(.title)\n\n\(.body)\n"
+              + (.comments | map("\n---\n@\(.author.login) commented:\n\(.body)\n") | join(""))' > "$PROMPT_FILE"
+          else
+            echo "Run repository verification and fix any failing checks." > "$PROMPT_FILE"
+          fi
+
+          if [ ! -s "$PROMPT_FILE" ]; then
+            echo "::error::Task prompt is empty; refusing to run the agent without a task."
+            exit 1
+          fi
+
+      - name: Download Refined Spec from Refinement Job (if issue run)
+        if: needs.refine.result == 'success' && needs.refine.outputs.status == 'ready'
+        uses: actions/download-artifact@v8
+        with:
+          name: pi-refine-bundle-${{ github.run_id }}
+          path: /tmp/pi-refine
+
+      - name: Attach Refined Spec to Agent Artifacts
+        if: needs.refine.result == 'success' && needs.refine.outputs.status == 'ready'
+        run: |
+          if [ -f /tmp/pi-refine/artifacts/refinement.json ]; then
+            cp /tmp/pi-refine/artifacts/refinement.json .pi/artifacts/refinement.json
+          fi
+
+      - name: Run Agent + Tiered Verification + Fresh-Context Critic (Steps 3-5)
+        id: agent_run
+        if: steps.intake.outputs.rebase_failed != 'true'
+        env:
+          AZURE_OPENAI_BASE_URL: ${{ secrets.AZURE_OPENAI_BASE_URL }}
+          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          # Leave unset to detect legacy Azure endpoints; generic endpoints are the default.
+          MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER || '' }}
+          MODEL_BASE_URL: ${{ secrets.MODEL_BASE_URL || vars.MODEL_BASE_URL || '' }}
+          MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
+          MODEL_COMPAT: ${{ vars.MODEL_COMPAT || '' }}
+          AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+          AWS_BEARER_TOKEN_BEDROCK: ${{ secrets.AWS_BEARER_TOKEN_BEDROCK }}
+          # Agent engine per role: "pi" (default) or "opencode" (see scripts/agent/harness.mjs)
+          IMPLEMENTER_ENGINE: ${{ vars.IMPLEMENTER_ENGINE || vars.AGENT_ENGINE || 'pi' }}
+          STRATEGIST_ENGINE: ${{ vars.STRATEGIST_ENGINE || vars.AGENT_ENGINE || 'pi' }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL || vars.OPENAI_BASE_URL || '' }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          IMPLEMENTER_MODEL: ${{ inputs.model || vars.IMPLEMENTER_MODEL || '' }}
+          IMPLEMENTER_API: ${{ vars.IMPLEMENTER_API || '' }}
+          STRATEGIST_MODEL: ${{ vars.STRATEGIST_MODEL || '' }}
+          STRATEGIST_API: ${{ vars.STRATEGIST_API || '' }}
+          AZURE_OPENAI_MODEL: ${{ vars.AZURE_OPENAI_MODEL || '' }}
+          AZURE_CRITIC_MODEL: ${{ vars.AZURE_CRITIC_MODEL || '' }}
+          # Wire format for endpoint providers; native Bedrock ignores this setting.
+          AZURE_OPENAI_API: ${{ vars.AZURE_OPENAI_API || '' }}
+          AZURE_MODEL_COMPAT: ${{ vars.AZURE_MODEL_COMPAT || '' }}
+          ENABLE_CRITIC: ${{ vars.ENABLE_CRITIC || 'false' }}
+          PI_THINKING_LEVEL: ${{ vars.PI_THINKING_LEVEL || 'high' }}
+          MODEL_COST_INPUT_PER_1M: ${{ vars.MODEL_COST_INPUT_PER_1M || '' }}
+          MODEL_COST_OUTPUT_PER_1M: ${{ vars.MODEL_COST_OUTPUT_PER_1M || '' }}
+          MODEL_COST_CACHE_READ_PER_1M: ${{ vars.MODEL_COST_CACHE_READ_PER_1M || '' }}
+          MODEL_COST_CACHE_WRITE_PER_1M: ${{ vars.MODEL_COST_CACHE_WRITE_PER_1M || '' }}
+          AZURE_COST_INPUT_PER_1M: ${{ vars.AZURE_COST_INPUT_PER_1M || '' }}
+          AZURE_COST_OUTPUT_PER_1M: ${{ vars.AZURE_COST_OUTPUT_PER_1M || '' }}
+          AZURE_COST_CACHE_READ_PER_1M: ${{ vars.AZURE_COST_CACHE_READ_PER_1M || '' }}
+        run: |
+          export AGENT_TASK_PROMPT="$(cat .pi/artifacts/task-prompt.txt)"
+          node /tmp/agent-scripts/run-pi-agent.mjs
+
+      - name: Ship Session Trajectory & Costs to Langfuse (Layer 6, Non-Blocking)
+        if: always() && steps.intake.outputs.rebase_failed != 'true'
+        continue-on-error: true
+        env:
+          MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER || '' }}
+          LANGFUSE_BASE_URL: ${{ secrets.LANGFUSE_BASE_URL || vars.LANGFUSE_BASE_URL || 'https://cloud.langfuse.com' }}
+          LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+          LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+          IMPLEMENTER_MODEL: ${{ inputs.model || vars.IMPLEMENTER_MODEL || '' }}
+          IMPLEMENTER_API: ${{ vars.IMPLEMENTER_API || '' }}
+          STRATEGIST_MODEL: ${{ vars.STRATEGIST_MODEL || '' }}
+          STRATEGIST_API: ${{ vars.STRATEGIST_API || '' }}
+          AZURE_OPENAI_MODEL: ${{ vars.AZURE_OPENAI_MODEL || '' }}
+          AZURE_OPENAI_API: ${{ vars.AZURE_OPENAI_API || '' }}
+          # Groups all runs for the same issue/PR into one Langfuse session
+          ISSUE_NUM: ${{ steps.intake.outputs.issue_number }}
+          BRANCH_NAME: ${{ steps.intake.outputs.branch_name }}
+        run: node /tmp/agent-scripts/push-trace-to-langfuse.mjs
+
+      - name: Export binary git patch against origin/main
+        id: export_patch
+        if: steps.intake.outputs.rebase_failed != 'true' && steps.agent_run.outputs.clarification_needed != 'true'
+        run: |
+          git add -A
+          git reset HEAD -- .pi/agent .pi/sessions .pi/artifacts 2>/dev/null || true
+          git diff --cached --binary origin/main > .pi/artifacts/changes.patch
+          if [ -s .pi/artifacts/changes.patch ]; then
+            echo "has_patch=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_patch=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload Patch & Telemetry Artifacts for Publish Job
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pi-agent-bundle-${{ github.run_id }}
+          path: |
+            .pi/artifacts/
+            .pi/sessions/
+          if-no-files-found: ignore
+
+  # ==========================================================================
+  # JOB 2: Policy Verification & Safe PR Publish (No Agent/LLM Execution)
+  # - Runs on a clean VM; never executes agent-written scripts
+  # - Validates patch against the 6-Row Security & Review Matrix vs origin/main
+  # - Pushes with GitHub App token (or fallback token) so CI runs on agent PRs
+  # ==========================================================================
+  publish:
+    name: "Job 2: Policy Gate & Publish PR"
+    needs: [refine, agent]
+    if: >
+      !cancelled() &&
+      ((needs.refine.result == 'success' && needs.agent.result == 'skipped') ||
+       needs.agent.result == 'success' ||
+       needs.agent.outputs.rebase_failed == 'true' ||
+       needs.agent.outputs.clarification_needed == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: pi-agent-publish-${{ github.event.issue.number || github.event.pull_request.number || inputs.issue_number || inputs.fix_pr || github.run_id }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    outputs:
+      pr_number: ${{ steps.publish.outputs.pr_number }}
+      eligible_auto_merge: ${{ steps.publish.outputs.eligible_auto_merge }}
+      policy_sha: ${{ steps.publish.outputs.policy_sha }}
+      issue_number: ${{ needs.agent.outputs.issue_number || needs.refine.outputs.issue_number }}
+
+    steps:
+      - name: Mint GitHub App Token (if APP_ID & APP_PRIVATE_KEY are configured)
+        id: app_token
+        if: ${{ vars.APP_ID != '' }}
+        continue-on-error: true
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Checkout clean repository (origin/main)
+        uses: actions/checkout@v7
+        with:
+          # Always start from main: on PR-review triggers the default ref is the PR merge commit
+          ref: main
+          fetch-depth: 0
+          token: ${{ steps.app_token.outputs.token || secrets.AGENT_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - name: Download Refinement Artifacts (if refinement ran)
+        if: needs.refine.result == 'success'
+        uses: actions/download-artifact@v8
+        with:
+          name: pi-refine-bundle-${{ github.run_id }}
+          path: /tmp/pi-refine
+
+      - name: Publish Refinement Comment & Labels on Issue
+        if: needs.refine.result == 'success'
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token || secrets.AGENT_PAT || secrets.GITHUB_TOKEN }}
+          ISSUE_NUM: ${{ needs.refine.outputs.issue_number }}
+          REFINE_STATUS: ${{ needs.refine.outputs.status }}
+        run: |
+          if [[ "$ISSUE_NUM" =~ ^[0-9]+$ ]] && [ -f /tmp/pi-refine/artifacts/refinement-comment.md ]; then
+            gh issue comment "$ISSUE_NUM" --body-file /tmp/pi-refine/artifacts/refinement-comment.md
+          fi
+
+          if [ "$REFINE_STATUS" = "needs_clarification" ]; then
+            gh label create "needs-clarification" --color "fbca04" --description "Waiting for human clarification before agent implementation" --force || true
+            gh issue edit "$ISSUE_NUM" --add-label "needs-clarification" || true
+            echo "Refinement requested clarification on Issue #${ISSUE_NUM}; stopping before implementation."
+            exit 0
+          elif [ "$REFINE_STATUS" = "ready" ]; then
+            gh issue edit "$ISSUE_NUM" --remove-label "needs-clarification" 2>/dev/null || true
+          else
+            echo "::error::Refinement failed closed on Issue #${ISSUE_NUM} (status=${REFINE_STATUS})."
+            exit 1
+          fi
+
+      - name: Download Patch & Artifacts from Agent Job
+        if: needs.agent.result != 'skipped'
+        uses: actions/download-artifact@v8
+        with:
+          name: pi-agent-bundle-${{ github.run_id }}
+          path: .pi
+
+      - name: Comment on Issue/PR if Rebase Failed
+        if: needs.agent.outputs.rebase_failed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token || secrets.AGENT_PAT || secrets.GITHUB_TOKEN }}
+          ISSUE_NUM: ${{ needs.agent.outputs.issue_number }}
+        run: |
+          if [[ "$ISSUE_NUM" =~ ^[0-9]+$ ]] && [ -f .pi/artifacts/rebase-failed.md ]; then
+            gh issue comment "$ISSUE_NUM" --body-file .pi/artifacts/rebase-failed.md || gh pr comment "$ISSUE_NUM" --body-file .pi/artifacts/rebase-failed.md
+          fi
+          exit 1
+
+      - name: Post Clarifying Questions if Circuit Breaker Triggered
+        if: needs.agent.outputs.clarification_needed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token || secrets.AGENT_PAT || secrets.GITHUB_TOKEN }}
+          ISSUE_NUM: ${{ needs.agent.outputs.issue_number }}
+        run: |
+          if [[ "$ISSUE_NUM" =~ ^[0-9]+$ ]] && [ -f .pi/artifacts/clarification-needed.md ]; then
+            gh issue comment "$ISSUE_NUM" --body-file .pi/artifacts/clarification-needed.md || gh pr comment "$ISSUE_NUM" --body-file .pi/artifacts/clarification-needed.md
+          fi
+          echo "Paused waiting for human reply on Issue/PR #${ISSUE_NUM}."
+
+      - name: Validate Patch Policy (6-Row Matrix) & Publish Pull Request
+        id: publish
+        if: needs.agent.outputs.rebase_failed != 'true' && needs.agent.outputs.clarification_needed != 'true' && needs.agent.outputs.has_patch == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token || secrets.AGENT_PAT || secrets.GITHUB_TOKEN }}
+          BRANCH_NAME: ${{ needs.agent.outputs.branch_name }}
+          BASE_SHA: ${{ needs.agent.outputs.base_sha }}
+          ISSUE_NUM: ${{ needs.agent.outputs.issue_number }}
+          ENABLE_AUTO_MERGE: ${{ vars.ENABLE_AUTO_MERGE || 'false' }}
+          # Policy result lives outside .pi/ because .pi/ comes from the untrusted agent artifact
+          POLICY_OUTPUT: /tmp/patch-policy.json
+        run: |
+          # Copy the policy validator and config loader from clean origin/main to /tmp BEFORE applying the patch
+          # so a patch can never tamper with the validator script itself.
+          cp scripts/agent/validate-patch-policy.mjs /tmp/validate-patch-policy.mjs
+          cp scripts/agent/pipeline-config.mjs /tmp/pipeline-config.mjs
+
+          git config user.name "pi-coding-agent[bot]"
+          git config user.email "pi-coding-agent[bot]@users.noreply.github.com"
+
+          git checkout -B "$BRANCH_NAME" origin/main
+          git apply --index --binary .pi/artifacts/changes.patch
+
+          # Enforce the 6-Row Security & Review Matrix against origin/main
+          node /tmp/validate-patch-policy.mjs
+
+          POLICY_LABELS="$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.env.POLICY_OUTPUT)).labels.join(","))')"
+          ELIGIBLE_AUTO_MERGE="$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.env.POLICY_OUTPUT)).eligibleForAutoMerge)')"
+
+          git commit -m "feat(agent): resolve #${ISSUE_NUM}"
+          # Lease against the SHA the agent job started from (empty = branch must not exist yet),
+          # so commits pushed by a human during the run are never silently overwritten.
+          git push --force-with-lease="refs/heads/${BRANCH_NAME}:${BASE_SHA}" -u origin "$BRANCH_NAME"
+          # The commit the policy gate just approved; auto-merge requires the verifier to have checked this same commit
+          echo "policy_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+          TRACE_URL="$(node -e 'try { console.log(JSON.parse(require("fs").readFileSync(".pi/artifacts/trace-summary.json")).traceUrl) } catch { console.log("N/A") }')"
+          TOTAL_COST="$(node -e 'try { console.log(JSON.parse(require("fs").readFileSync(".pi/artifacts/trace-summary.json")).totalCostUsd.toFixed(4)) } catch { console.log("0.0000") }')"
+
+          cat <<EOF >> .pi/artifacts/pr-summary.md
+
+          ---
+          ### Telemetry & Governance
+          - **Linked Issue:** Closes #${ISSUE_NUM}
+          - **Langfuse Trace:** ${TRACE_URL}
+          - **Estimated Run Cost:** \$${TOTAL_COST} USD
+          - **Policy Review Labels:** ${POLICY_LABELS:-none}
+          EOF
+
+          EXISTING_PR="$(gh pr list --head "$BRANCH_NAME" --json number --jq '.[0].number')"
+          if [ -n "$EXISTING_PR" ]; then
+            PR_NUM="$EXISTING_PR"
+            gh pr comment "$PR_NUM" --body-file .pi/artifacts/pr-summary.md
+          else
+            PR_URL="$(gh pr create \
+              --title "[agent] Resolve #${ISSUE_NUM}" \
+              --body-file .pi/artifacts/pr-summary.md \
+              --base main \
+              --head "$BRANCH_NAME")"
+            PR_NUM="$(gh pr view "$BRANCH_NAME" --json number --jq '.number')"
+          fi
+          echo "pr_number=${PR_NUM}" >> "$GITHUB_OUTPUT"
+
+          # Apply review labels if package.json, package-lock.json, or tests/ were touched
+          if [ -n "$POLICY_LABELS" ]; then
+            IFS=',' read -ra ADDR <<< "$POLICY_LABELS"
+            for LABEL in "${ADDR[@]}"; do
+              gh label create "$LABEL" --color "d93f0b" --description "Requires human review of agent changes" --force || true
+              gh pr edit "$PR_NUM" --add-label "$LABEL" || true
+            done
+          fi
+
+          # Auto-merge is decided in Job 4, and only after the verifier passes this exact commit.
+          # Here we only record whether the policy gate allows it at all.
+          echo "eligible_auto_merge=${ELIGIBLE_AUTO_MERGE}" >> "$GITHUB_OUTPUT"
+          echo "Policy: eligibleForAutoMerge=${ELIGIBLE_AUTO_MERGE}, labels=${POLICY_LABELS:-none}, ENABLE_AUTO_MERGE=${ENABLE_AUTO_MERGE}."
+
+      # Stage 7 Evidence: show the agent's Playwright screenshot inline on the PR. The image is
+      # stored on the orphan `agent-evidence` branch (never merged), so main stays free of PNGs.
+      - name: Post UI Screenshot Evidence on the PR
+        if: success() && steps.publish.outputs.pr_number != ''
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token || secrets.AGENT_PAT || secrets.GITHUB_TOKEN }}
+          PR_NUM: ${{ steps.publish.outputs.pr_number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          SCREENSHOT_PATH="$(node -e 'import("./scripts/agent/pipeline-config.mjs").then((m) => console.log(m.loadPipelineConfig().screenshotPath))')"
+          EVIDENCE_PATH="$(scripts/agent/publish-evidence.sh "$SCREENSHOT_PATH" "$PR_NUM" "$GITHUB_RUN_ID")"
+          if [ -z "$EVIDENCE_PATH" ]; then
+            echo "No UI screenshot in this run."
+            exit 0
+          fi
+          IMAGE_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/blob/agent-evidence/${EVIDENCE_PATH}?raw=true"
+          {
+            echo "### UI evidence"
+            echo ""
+            echo "Playwright screenshot the agent took after its change ([run](${RUN_URL})):"
+            echo ""
+            echo "![UI screenshot](${IMAGE_URL})"
+          } > /tmp/evidence-comment.md
+          gh pr comment "$PR_NUM" --body-file /tmp/evidence-comment.md
+
+  # ==========================================================================
+  # JOB 3: Stage 4/5 Independent Verifier Agent (Strategist Role, Read-Only)
+  # - Isolated like `agent`: read-only token, persist-credentials: false, model credentials only
+  # - Copies scripts/agent/ from origin/main to /tmp/agent-scripts BEFORE checking out PR head
+  # - Starts app via .pi/pipeline.json, reviews diff + runs per-AC Playwright QA
+  # ==========================================================================
+  verify:
+    name: "Job 3: Verifier Agent (Strategist Review + QA)"
+    needs: [publish]
+    if: >
+      !cancelled() &&
+      vars.AGENT_ENABLED != 'false' &&
+      ((needs.publish.result == 'success' && needs.publish.outputs.pr_number != '') ||
+       (github.event_name == 'workflow_dispatch' && inputs.verify_pr != ''))
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: pi-agent-verify-${{ needs.publish.outputs.pr_number || inputs.verify_pr || github.run_id }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    outputs:
+      pr_number: ${{ steps.verify_prep.outputs.pr_number }}
+      issue_number: ${{ steps.verify_prep.outputs.issue_number }}
+      head_sha: ${{ steps.verify_prep.outputs.head_sha }}
+      verdict: ${{ steps.verify_run.outputs.verdict }}
+
+    steps:
+      - name: Verify trigger user has collaborator write permission
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TRIGGER_USER: ${{ github.actor }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && "$TRIGGER_USER" == *"[bot]" ]]; then
+            echo "Triggered via workflow_dispatch by authenticated bot '${TRIGGER_USER}'; allowed."
+            exit 0
+          fi
+          PERM="$(gh api "repos/${GITHUB_REPOSITORY}/collaborators/${TRIGGER_USER}/permission" --jq '.permission')"
+          echo "Trigger user '${TRIGGER_USER}' permission: ${PERM}"
+          if [[ "$PERM" != "admin" && "$PERM" != "maintain" && "$PERM" != "write" ]]; then
+            echo "::error::User ${TRIGGER_USER} does not have write access to trigger the verifier agent."
+            exit 1
+          fi
+
+      - name: Checkout repository (no persisted credentials)
+        uses: actions/checkout@v7
+        with:
+          # Always start from main: on PR-review triggers the default ref is the PR merge commit
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Copy trusted verifier scripts from origin/main & checkout PR head
+        id: verify_prep
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PUBLISH_PR_NUM: ${{ needs.publish.outputs.pr_number }}
+          PUBLISH_ISSUE_NUM: ${{ needs.publish.outputs.issue_number }}
+          INPUT_VERIFY_PR: ${{ inputs.verify_pr }}
+        run: |
+          rm -rf /tmp/agent-scripts /tmp/verify-meta
+          mkdir -p /tmp/agent-scripts /tmp/verify-meta
+          git archive origin/main scripts/agent | tar -x -C /tmp/agent-scripts --strip-components=2
+
+          PR_NUM="${PUBLISH_PR_NUM:-$INPUT_VERIFY_PR}"
+          if [ -z "$PR_NUM" ]; then
+            echo "::error::No PR number provided to verify job."
+            exit 1
+          fi
+
+          gh pr view "$PR_NUM" --json number,title,body,headRefName,headRefOid,labels,isCrossRepository > /tmp/verify-meta/verify-pr.json
+          HEAD_REF="$(node -e 'console.log(JSON.parse(require("fs").readFileSync("/tmp/verify-meta/verify-pr.json", "utf8")).headRefName)')"
+          HEAD_OID="$(node -e 'console.log(JSON.parse(require("fs").readFileSync("/tmp/verify-meta/verify-pr.json", "utf8")).headRefOid)')"
+          IS_FORK="$(node -e 'console.log(JSON.parse(require("fs").readFileSync("/tmp/verify-meta/verify-pr.json", "utf8")).isCrossRepository)')"
+
+          # The verifier runs the PR's code (npm ci, app start). Only agent PRs from this repo have
+          # passed the publish-job policy gate, so refuse everything else.
+          if [ "$IS_FORK" != "false" ]; then
+            echo "::error::Refusing to verify PR #${PR_NUM}: it comes from a fork."
+            exit 1
+          fi
+          case "$HEAD_REF" in
+            agent/*) ;;
+            *)
+              echo "::error::Refusing to verify PR #${PR_NUM}: branch '${HEAD_REF}' is not an agent/* branch."
+              exit 1
+              ;;
+          esac
+
+          ISSUE_NUM="$PUBLISH_ISSUE_NUM"
+          if [[ ! "$ISSUE_NUM" =~ ^[0-9]+$ ]]; then
+            if [[ "$HEAD_REF" =~ ^agent/issue-([0-9]+)$ ]]; then
+              ISSUE_NUM="${BASH_REMATCH[1]}"
+            else
+              ISSUE_NUM="$(node -e '
+                const body = JSON.parse(require("fs").readFileSync("/tmp/verify-meta/verify-pr.json", "utf8")).body || "";
+                const m = body.match(/Closes #([0-9]+)/i);
+                console.log(m ? m[1] : "");
+              ')"
+            fi
+          fi
+          if [ -z "$ISSUE_NUM" ]; then
+            ISSUE_NUM="$PR_NUM"
+          fi
+
+          if [[ "$ISSUE_NUM" =~ ^[0-9]+$ ]]; then
+            gh issue view "$ISSUE_NUM" --json number,title,body,comments > /tmp/verify-meta/verify-issue.json 2>/dev/null || true
+          fi
+
+          if git rev-parse --verify --quiet "refs/remotes/origin/${HEAD_REF}" >/dev/null; then
+            git checkout --detach "refs/remotes/origin/${HEAD_REF}"
+          else
+            git checkout --detach "$HEAD_OID"
+          fi
+
+          mkdir -p .pi/artifacts .pi/sessions .pi/qa
+          cp /tmp/verify-meta/*.json .pi/artifacts/
+
+          echo "pr_number=${PR_NUM}" >> "$GITHUB_OUTPUT"
+          echo "issue_number=${ISSUE_NUM}" >> "$GITHUB_OUTPUT"
+          # The exact commit under verification; a verdict only ever applies to this SHA
+          echo "head_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node.js 24 with npm cache
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Cache & Install Playwright Chromium
+        uses: actions/cache@v6
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('package-lock.json') }}
+
+      - name: Ensure Playwright Chromium is installed
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: npx playwright install --with-deps chromium
+
+      - name: Install Playwright OS dependencies (when cached)
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: npx playwright install-deps chromium
+
+      - name: Run Strategist Verifier (Code Review + Per-AC Playwright QA)
+        id: verify_run
+        env:
+          AZURE_OPENAI_BASE_URL: ${{ secrets.AZURE_OPENAI_BASE_URL }}
+          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          # Leave unset to detect legacy Azure endpoints; generic endpoints are the default.
+          MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER || '' }}
+          MODEL_BASE_URL: ${{ secrets.MODEL_BASE_URL || vars.MODEL_BASE_URL || '' }}
+          MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
+          MODEL_COMPAT: ${{ vars.MODEL_COMPAT || '' }}
+          AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+          AWS_BEARER_TOKEN_BEDROCK: ${{ secrets.AWS_BEARER_TOKEN_BEDROCK }}
+          # Agent engine per role: "pi" (default) or "opencode" (see scripts/agent/harness.mjs)
+          IMPLEMENTER_ENGINE: ${{ vars.IMPLEMENTER_ENGINE || vars.AGENT_ENGINE || 'pi' }}
+          STRATEGIST_ENGINE: ${{ vars.STRATEGIST_ENGINE || vars.AGENT_ENGINE || 'pi' }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL || vars.OPENAI_BASE_URL || '' }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          IMPLEMENTER_MODEL: ${{ inputs.model || vars.IMPLEMENTER_MODEL || '' }}
+          IMPLEMENTER_API: ${{ vars.IMPLEMENTER_API || '' }}
+          STRATEGIST_MODEL: ${{ vars.STRATEGIST_MODEL || '' }}
+          STRATEGIST_API: ${{ vars.STRATEGIST_API || '' }}
+          AZURE_OPENAI_MODEL: ${{ vars.AZURE_OPENAI_MODEL || '' }}
+          AZURE_OPENAI_API: ${{ vars.AZURE_OPENAI_API || '' }}
+          AZURE_MODEL_COMPAT: ${{ vars.AZURE_MODEL_COMPAT || '' }}
+          PI_THINKING_LEVEL: ${{ vars.PI_THINKING_LEVEL || 'high' }}
+          MODEL_COST_INPUT_PER_1M: ${{ vars.MODEL_COST_INPUT_PER_1M || '' }}
+          MODEL_COST_OUTPUT_PER_1M: ${{ vars.MODEL_COST_OUTPUT_PER_1M || '' }}
+          MODEL_COST_CACHE_READ_PER_1M: ${{ vars.MODEL_COST_CACHE_READ_PER_1M || '' }}
+          MODEL_COST_CACHE_WRITE_PER_1M: ${{ vars.MODEL_COST_CACHE_WRITE_PER_1M || '' }}
+          AZURE_COST_INPUT_PER_1M: ${{ vars.AZURE_COST_INPUT_PER_1M || '' }}
+          AZURE_COST_OUTPUT_PER_1M: ${{ vars.AZURE_COST_OUTPUT_PER_1M || '' }}
+          AZURE_COST_CACHE_READ_PER_1M: ${{ vars.AZURE_COST_CACHE_READ_PER_1M || '' }}
+        run: node /tmp/agent-scripts/verification.mjs
+
+      - name: Ship Verifier Session & Per-AC Scores to Langfuse (Non-Blocking)
+        if: always()
+        continue-on-error: true
+        env:
+          MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER || '' }}
+          LANGFUSE_BASE_URL: ${{ secrets.LANGFUSE_BASE_URL || vars.LANGFUSE_BASE_URL || 'https://cloud.langfuse.com' }}
+          LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+          LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+          IMPLEMENTER_MODEL: ${{ inputs.model || vars.IMPLEMENTER_MODEL || '' }}
+          IMPLEMENTER_API: ${{ vars.IMPLEMENTER_API || '' }}
+          STRATEGIST_MODEL: ${{ vars.STRATEGIST_MODEL || '' }}
+          STRATEGIST_API: ${{ vars.STRATEGIST_API || '' }}
+          AZURE_OPENAI_MODEL: ${{ vars.AZURE_OPENAI_MODEL || '' }}
+          AZURE_OPENAI_API: ${{ vars.AZURE_OPENAI_API || '' }}
+          ISSUE_NUM: ${{ steps.verify_prep.outputs.issue_number }}
+          LANGFUSE_TAG: "verifier"
+          LANGFUSE_TRACE_NAME: "pi-verify PR #${{ steps.verify_prep.outputs.pr_number }}"
+        run: node /tmp/agent-scripts/push-trace-to-langfuse.mjs
+
+      - name: Upload Verifier Artifacts & Per-AC QA Screenshots
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pi-verify-bundle-${{ github.run_id }}
+          path: |
+            .pi/artifacts/
+            .pi/qa/
+            .pi/sessions/
+          if-no-files-found: ignore
+
+  # ==========================================================================
+  # JOB 4: Publish Verifier Review, Per-AC Screenshots & Bounded Fix Loop
+  # - Runs on a clean VM with GitHub App token; no model calls
+  # - Posts PR review with event COMMENT (never APPROVE or REQUEST_CHANGES)
+  # - Triggers at most 1 automatic fix round (label `pi-fix-round-1`)
+  # ==========================================================================
+  verify-publish:
+    name: "Job 4: Publish Verifier Review & Bounded Fix Loop"
+    # publish is skipped for manual verify_pr runs; !cancelled() below keeps this job running then
+    needs: [publish, verify]
+    if: >
+      !cancelled() &&
+      needs.verify.result == 'success' &&
+      needs.verify.outputs.pr_number != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: pi-agent-verify-publish-${{ needs.verify.outputs.pr_number || github.run_id }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: write
+      statuses: write
+
+    steps:
+      - name: Mint GitHub App Token (if APP_ID & APP_PRIVATE_KEY are configured)
+        id: app_token
+        if: ${{ vars.APP_ID != '' }}
+        continue-on-error: true
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Checkout clean repository (origin/main)
+        uses: actions/checkout@v7
+        with:
+          # Always start from main: on PR-review triggers the default ref is the PR merge commit
+          ref: main
+          fetch-depth: 0
+          token: ${{ steps.app_token.outputs.token || secrets.AGENT_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      # A commit status on the verified SHA, so branch protection can require "pi-verifier"
+      - name: Report Verifier Result as Commit Status
+        if: needs.verify.outputs.head_sha != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ needs.verify.outputs.head_sha }}
+          VERDICT: ${{ needs.verify.outputs.verdict }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ "$VERDICT" = "pass" ]; then STATE=success; DESC="All acceptance criteria passed"; else STATE=failure; DESC="Verifier verdict: ${VERDICT:-none}"; fi
+          gh api "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" --method POST \
+            -f state="$STATE" -f context="pi-verifier" -f description="$DESC" -f target_url="$RUN_URL"
+
+      - name: Download Verifier Artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: pi-verify-bundle-${{ github.run_id }}
+          path: .pi
+
+      - name: Publish Per-AC Screenshots, Post PR Review (COMMENT), and Trigger Fix Round
+        id: verify_publish
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token || secrets.AGENT_PAT || secrets.GITHUB_TOKEN }}
+          PR_NUM: ${{ needs.verify.outputs.pr_number }}
+          PR_LABELS_FILE: /tmp/pr-labels.json
+          REVIEW_PAYLOAD_OUT: /tmp/review-payload.json
+          REVIEW_FALLBACK_OUT: /tmp/review-payload-no-inline.json
+        run: |
+          git config user.name "pi-coding-agent[bot]"
+          git config user.email "pi-coding-agent[bot]@users.noreply.github.com"
+
+          gh pr view "$PR_NUM" --json labels > "$PR_LABELS_FILE"
+          node scripts/agent/verification.mjs --prepare-publish
+
+          if ! gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUM}/reviews" --method POST --input "$REVIEW_PAYLOAD_OUT"; then
+            echo "Inline review comments rejected by GitHub API; falling back to review body without inline comments..."
+            gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUM}/reviews" --method POST --input "$REVIEW_FALLBACK_OUT"
+          fi
+
+      - name: Trigger Bounded Fix Round (Max 1 Round via pi-fix-round-1 Label)
+        if: steps.verify_publish.outputs.will_trigger_fix == 'true'
+        env:
+          APP_TOKEN: ${{ steps.app_token.outputs.token || secrets.AGENT_PAT || secrets.GITHUB_TOKEN }}
+          ACTIONS_TOKEN: ${{ secrets.AGENT_PAT || secrets.GITHUB_TOKEN }}
+          PR_NUM: ${{ needs.verify.outputs.pr_number }}
+        run: |
+          GH_TOKEN="$APP_TOKEN" gh label create "pi-fix-round-1" --color "fbca04" --description "Automated verifier triggered 1 bounded repair run" --force || true
+          GH_TOKEN="$APP_TOKEN" gh pr edit "$PR_NUM" --add-label "pi-fix-round-1"
+          echo "Triggering bounded fix round for PR #${PR_NUM}..."
+          GH_TOKEN="$ACTIONS_TOKEN" gh workflow run pi-agent.yml -f fix_pr="$PR_NUM" || \
+            GH_TOKEN="$APP_TOKEN" gh workflow run pi-agent.yml -f fix_pr="$PR_NUM"
+
+      # Auto-merge gate: opt-in ENABLE_AUTO_MERGE=true, a policy-clean patch (no review labels),
+      # and a verifier pass, all on the same commit. --match-head-commit refuses to merge if the
+      # branch moved after QA.
+      - name: Queue Auto-Merge (Verifier Pass Only)
+        if: >
+          vars.ENABLE_AUTO_MERGE == 'true' &&
+          needs.verify.outputs.verdict == 'pass' &&
+          needs.publish.outputs.eligible_auto_merge == 'true' &&
+          needs.verify.outputs.head_sha != ''
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token || secrets.AGENT_PAT || secrets.GITHUB_TOKEN }}
+          PR_NUM: ${{ needs.verify.outputs.pr_number }}
+          HEAD_SHA: ${{ needs.verify.outputs.head_sha }}
+          POLICY_SHA: ${{ needs.publish.outputs.policy_sha }}
+        run: |
+          # The branch moved between publish and verification (e.g. a human push): the policy result
+          # covers a different commit than the verifier did, so leave the merge to a human.
+          if [ "$POLICY_SHA" != "$HEAD_SHA" ]; then
+            echo "Not auto-merging PR #${PR_NUM}: policy checked ${POLICY_SHA:-nothing}, verifier checked ${HEAD_SHA}."
+            exit 0
+          fi
+          echo "Verifier passed ${HEAD_SHA} and the patch is policy-clean. Queuing auto-merge for PR #${PR_NUM}..."
+          gh pr merge "$PR_NUM" --auto --squash --match-head-commit "$HEAD_SHA" || true

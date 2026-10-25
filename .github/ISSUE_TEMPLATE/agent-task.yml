@@ -1,0 +1,40 @@
+name: Agent task
+description: A bounded task for the pi coding agent. Add the `agent` label (or comment `@pi`) to start it.
+title: "[Task] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The agent only knows what you write here. A clear goal and checkable acceptance criteria
+        are the difference between a good PR and a guess. Unclear tasks get clarifying questions instead of code.
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What should change, and why? One outcome per issue.
+      placeholder: Users can remove all completed tasks at once, so the list stays short.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Where in the product does this live? Relevant files, screens, or prior issues if you know them.
+      placeholder: Task list on the dashboard (public/index.html, public/app.js); logic in src/task-store.ts.
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Concrete, checkable statements. These are what the result is verified against.
+      placeholder: |
+        - A "Clear completed" button is shown above the task list
+        - Clicking it removes all tasks with status "done"; other tasks stay
+        - Unit test for the store logic and an assertion in the existing e2e test
+    validations:
+      required: true
+  - type: textarea
+    id: out-of-scope
+    attributes:
+      label: Out of scope
+      description: What the agent should not change or add.
+      placeholder: No confirmation dialog, no styling changes to other buttons.

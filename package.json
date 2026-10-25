@@ -1,0 +1,38 @@
+{
+  "name": "repo2ship",
+  "version": "1.0.0",
+  "description": "GitHub-native issue-to-PR automation with Pi or OpenCode, policy checks, and independent verification",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/dev-server.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "playwright test",
+    "verify": "npm run typecheck && npm test",
+    "verify:full": "npm run typecheck && npm test && npm run test:e2e",
+    "agent:setup-models": "node scripts/agent/model-config.mjs",
+    "agent:run": "node scripts/agent/run-pi-agent.mjs",
+    "agent:critic": "node scripts/agent/run-pi-critic.mjs",
+    "agent:langfuse": "node scripts/agent/push-trace-to-langfuse.mjs"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^1.4.0",
+    "@playwright/test": "^1.51.0",
+    "@types/node": "^24.19.2",
+    "typescript": "^5.8.2",
+    "vitest": "^4.1.12"
+  },
+  "overrides": {
+    "undici": "^8.12.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/RidSib/repo2ship.git"
+  },
+  "bugs": {
+    "url": "https://github.com/RidSib/repo2ship/issues"
+  },
+  "homepage": "https://github.com/RidSib/repo2ship#readme"
+}

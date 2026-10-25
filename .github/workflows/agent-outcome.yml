@@ -1,0 +1,41 @@
+name: "Agent PR Outcome Scores"
+
+# When an agent PR is merged or closed, attach the outcome to its Langfuse traces
+# (merged, human-edited, runs needed) so agent quality can be measured per model over time.
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  score:
+    if: startsWith(github.event.pull_request.head.ref, 'agent/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Run the scoring script from main, never from the PR branch, since this job holds Langfuse keys
+      - name: Checkout main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - name: Score PR outcome in Langfuse
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+          LANGFUSE_BASE_URL: ${{ vars.LANGFUSE_BASE_URL || 'https://cloud.langfuse.com' }}
+          LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+          LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+        run: |
+          gh pr view "$PR_NUM" --repo "$GITHUB_REPOSITORY" \
+            --json number,url,state,mergedAt,body,comments,commits > /tmp/pr.json
+          node scripts/agent/score-pr-outcome.mjs /tmp/pr.json
