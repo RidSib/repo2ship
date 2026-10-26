@@ -7,7 +7,7 @@ Repo2Ship is an open-source, GitHub-native coding pipeline you can drop into a r
 1. **Refines** it into testable acceptance criteria, or asks you clarifying questions on the issue.
 2. **Implements** it with [`pi`](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) or [OpenCode](https://opencode.ai) on a throwaway Actions runner, running your verify command after each attempt (up to 3 repair rounds).
 3. **Gates** the patch with a deterministic policy check (no model involved) and opens a PR.
-4. **Verifies** the PR with a separate model that reviews the diff and runs browser QA per acceptance criterion against the running app.
+4. **Verifies** the PR in a separate verifier run that reviews the diff and runs browser QA per acceptance criterion against the running app.
 5. **Fixes** at most one round of verifier findings automatically, then leaves the merge to a human.
 
 Every run's trajectory, token counts and cost are sent to [Langfuse](https://langfuse.com) (optional), and merged/closed agent PRs are scored there so you can compare models over time.
@@ -78,6 +78,23 @@ Set `IMPLEMENTER_MODEL` and optionally `STRATEGIST_MODEL` to models available fr
 | `.pi/pipeline.json` | **Per-project config**: verify commands, how to start the app, URL, UI paths, protected paths |
 | `AGENTS.md` (`CLAUDE.md` symlink) | Instructions the agent reads on every task |
 | `src/`, `public/`, `scripts/dev-server.mjs`, `tests/` | Demo app and its tests |
+
+### Choosing models
+
+**Recommended starting point: use two different models for implementation and strategy.** If cost is a concern, choose a cheaper model that is capable of working on your codebase as the **implementer**, and reserve a stronger reasoning and review model for the **strategist**. The implementer writes code and handles repair attempts; the strategist refines requirements, critiques changes, and verifies the result. This lets you concentrate more expensive model calls on planning and review, though total cost still depends on context size and the number of repair rounds.
+
+Even when cost is not the main concern, a two-model approach can be beneficial. Different models can bring different assumptions, failure patterns, and coding-style preferences. A reviewer using a different model may catch mistakes the implementing model overlooks when reviewing its own work, and can challenge recurring biases instead of reinforcing them. This is a potential benefit, not a guarantee that every pair will outperform one model: both models can miss the same bug. Reviews should prioritize correctness, acceptance criteria, and the repository's conventions over either model's preferred style. Keep deterministic tests and human review in place.
+
+For example, configure the two roles with actual model IDs available from your provider:
+
+```dotenv
+IMPLEMENTER_MODEL=your-cost-efficient-coding-model
+STRATEGIST_MODEL=your-stronger-review-model
+```
+
+Both roles currently share the configured provider and credentials, so choose a provider or endpoint that exposes both models. Engine selection is independent: switching between Pi and OpenCode while using the same underlying model does not provide model diversity.
+
+A one-model setup remains supported: leave `STRATEGIST_MODEL` unset to use the implementer's model for both roles. Start there if you need the simplest configuration, then compare model pairs using your own tasks, verification results, repair rounds, and optional Langfuse traces.
 
 ### Safety model
 
