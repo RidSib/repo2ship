@@ -1,0 +1,90 @@
+name: "Publish Release"
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: "Verify tagged release"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      prerelease: ${{ steps.metadata.outputs.prerelease }}
+      tag_oid: ${{ steps.source.outputs.tag_oid }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require a release commit from main
+        id: source
+        run: |
+          git merge-base --is-ancestor HEAD origin/main
+          echo "tag_oid=$(git rev-parse "$GITHUB_REF")" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: "npm"
+
+      - run: npm ci
+
+      - name: Validate tag, package versions, and release notes
+        id: metadata
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: node .github/scripts/release.mjs --tag "$RELEASE_TAG" --notes-file "$RUNNER_TEMP/release-notes.md"
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Verify release
+        run: npm run verify:full
+
+      - name: Save validated release notes
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-notes
+          path: ${{ runner.temp }}/release-notes.md
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: "Publish verified GitHub release"
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-notes
+          path: release-notes
+
+      - name: Publish release from existing tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          EXPECTED_TAG_OID: ${{ needs.verify.outputs.tag_oid }}
+          IS_PRERELEASE: ${{ needs.verify.outputs.prerelease }}
+        run: |
+          CURRENT_TAG_OID="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq '.object.sha')"
+          if [ "$CURRENT_TAG_OID" != "$EXPECTED_TAG_OID" ]; then
+            echo "::error::Release tag moved after verification. Refusing to publish."
+            exit 1
+          fi
+          OPTIONS=(--repo "$GITHUB_REPOSITORY" --verify-tag --title "Repo2Ship ${RELEASE_TAG}" --notes-file release-notes/release-notes.md)
+          if [ "$IS_PRERELEASE" = "true" ]; then
+            OPTIONS+=(--prerelease --latest=false)
+          fi
+          gh release create "$RELEASE_TAG" "${OPTIONS[@]}"

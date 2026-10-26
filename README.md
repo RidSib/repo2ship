@@ -69,6 +69,7 @@ Set `IMPLEMENTER_MODEL` and optionally `STRATEGIST_MODEL` to models available fr
 | Path | What it is |
 | :--- | :--- |
 | `.github/workflows/pi-agent.yml` | The pipeline (jobs 0–4 above) |
+| `.github/workflows/release.yml` | Validates version tags, runs full verification, and publishes GitHub releases |
 | `.github/workflows/ci.yml` | CI: typecheck, unit tests, Playwright e2e on PRs and `main` |
 | `.github/workflows/agent-outcome.yml` | Scores closed `agent/*` PRs in Langfuse |
 | `.github/ISSUE_TEMPLATE/agent-task.yml` | Issue form: goal, context, acceptance criteria, out of scope |
@@ -352,6 +353,14 @@ node --env-file=.env scripts/agent/run-pi-agent.mjs "Describe the task here"
 ```
 
 This edits your working tree, so run it on a clean branch.
+
+## Versioning
+
+Repo2Ship uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html), starting with `0.1.0`. During early development, `0.x` minor releases may include breaking changes; patch releases are intended for compatible fixes. Version `1.0.0` will mark the first stable documented configuration and CLI contract.
+
+See the [changelog](CHANGELOG.md) for release notes and [GitHub releases](https://github.com/RidSib/repo2ship/releases) for tagged source snapshots. Pin a release tag when you need a repeatable baseline; `main` continues to change. All `0.x` releases and versions with prerelease suffixes are marked as prereleases on GitHub.
+
+Maintainers update the package version and changelog in a reviewed PR, then push a matching `v<version>` tag from `main`. The release workflow checks that the tag belongs to `main`, validates package/lockfile versions and dated release notes, runs the full test suite, and publishes a GitHub release. It does not publish an npm package. See [the release checklist](CONTRIBUTING.md#versioning-and-releases).
 
 ## License
 
