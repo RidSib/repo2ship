@@ -104,14 +104,18 @@ A one-model setup remains supported: leave `STRATEGIST_MODEL` unset to use the i
 - `pi` runs with `--no-approve --no-mcp`, so a repo can never make it load project-local extensions, settings or MCP servers from `.pi/`. `AGENTS.md` is still read.
 - `opencode` runs with project config disabled, `--pure`, an isolated `HOME`, and a trusted inline config that sets providers and per-stage permissions, so a repo's `opencode.json` or `.opencode/` agents and plugins are never loaded. The policy gate also rejects patches that add them.
 - The policy gate (`scripts/agent/validate-patch-policy.mjs`) checks the patch against `origin/main`:
-  - **Rejects** changes to `.github/`, `scripts/agent/`, `AGENTS.md`, `CLAUDE.md`, `.pi/pipeline.json`, the `protectedPaths` in `.pi/pipeline.json`, and any change to `package.json` scripts.
-  - **Rejects** deleted test files and added `.skip` / `.only`.
-  - **Labels** dependency changes (`needs-dependency-review`) and test changes (`needs-test-review`), which also blocks auto-merge.
+  - **Rejects** changes to `.github/`, `scripts/agent/`, `AGENTS.md`, `CLAUDE.md`, `.pi/pipeline.json`, `.npmrc` files, the `protectedPaths` in `.pi/pipeline.json`, and any change to `package.json` scripts.
+  - **Rejects** deleted test files and added `.skip`, `.only`, `.fixme`, `.todo`, `.skipIf`, or `.runIf` bypasses.
+  - **Labels** dependency changes (`needs-dependency-review`), test changes (`needs-test-review`), and project scripts (`needs-runtime-review`), which also blocks auto-merge.
 - Only collaborators with write access can trigger the agent.
+- Issue/PR descriptions are the task selected by that trigger. Follow-up comments, reviews, and inline feedback are included only from current write collaborators or the configured publisher. Machine spec/verifier markers are accepted only from `AGENT_PUBLISHER_LOGIN`; quoting a marker in another comment does not make it authoritative.
+- Manual verifier runs check the exact selected PR commit against patch policy before installing its dependencies.
 - Auto-merge is off unless you set `ENABLE_AUTO_MERGE=true`. Keep it off for the initial setup. The queue request checks that the policy gate and verifier passed the same commit and there are no review labels. That check applies when queuing: a later push can leave GitHub auto-merge enabled for a newer commit. Use human merges for branches that may change while checks or reviews are pending.
 - Every verified agent commit gets a `pi-verifier` status (success or failure) you can see on the PR.
 - The verifier must report on every acceptance criterion in the spec; a result that skips one is rejected.
 - If the critic's repair pass leaves a mandatory issue (conflict markers, `debugger`, `.skip`/`.only`) unresolved, the run fails instead of opening a PR.
+- A failed or malformed enabled critic review stops publishing. Valid model objections remain advisory unless `STRICT_CRITIC=true`.
+- UI verification and the critic include committed and uncommitted changes against the base captured before implementation. Implementation, repairs, local verification, and critic calls share a 20-minute execution budget inside the 25-minute job.
 - `AGENT_ENABLED=false` stops every model-running job (see [Stopping the agent](#stopping-the-agent)).
 
 ---
@@ -158,6 +162,8 @@ Optional settings:
 | `MODEL_COST_CACHE_READ_PER_1M` / `MODEL_COST_CACHE_WRITE_PER_1M` | Variable | Model estimate | Override cache pricing. Explicit `0` is supported. |
 | `PI_THINKING_LEVEL` | Variable | `high` | Shared reasoning preference, translated by the harness where supported. |
 | `ENABLE_CRITIC` | Variable | `false` | Enable an extra critic call even when both roles use the same model. |
+| `STRICT_CRITIC` | Variable | `false` | Make valid model objections blocking; critic execution/schema errors always block. |
+| `AGENT_PUBLISHER_LOGIN` | Variable | `github-actions[bot]` | Exact GitHub login publishing refinement comments and verifier reviews. Set this to your App's `slug[bot]` or PAT user's login when using custom publishing credentials. |
 | `ENABLE_AUTO_MERGE` | Variable | `false` | Opt into auto-merge after policy and verifier checks. |
 | `AGENT_ENABLED` | Variable | `true` | Set `false` to stop model-running jobs. |
 | `IMPLEMENTER_ENGINE` / `STRATEGIST_ENGINE` | Variable | `pi` | `pi` or `opencode`; `AGENT_ENGINE` sets the default for both. |

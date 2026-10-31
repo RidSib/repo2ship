@@ -23,6 +23,7 @@ import { fileURLToPath } from "node:url";
 import { loadPipelineConfigFromRef } from "./pipeline-config.mjs";
 import { extractRefinedSpecFromComments } from "./refinement.mjs";
 import { runAgentOrThrow, setupEngines } from "./harness.mjs";
+import { isPipelinePublisher, stripPipelineMarkers } from "./github-intake.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -192,16 +193,7 @@ export function validateVerificationResult(raw) {
  */
 export function extractSpecForVerification(options = {}) {
   const { issueJson = null, prJson = null } = options;
-  const commentTexts = [];
-  if (issueJson?.body) commentTexts.push(issueJson.body);
-  if (Array.isArray(issueJson?.comments)) {
-    for (const c of issueJson.comments) {
-      if (c?.body) commentTexts.push(c.body);
-    }
-  }
-  if (prJson?.body) commentTexts.push(prJson.body);
-
-  const refined = extractRefinedSpecFromComments(commentTexts);
+  const refined = extractRefinedSpecFromComments(issueJson?.comments || []);
   if (refined && Array.isArray(refined.acceptanceCriteria) && refined.acceptanceCriteria.length > 0) {
     return {
       source: "refined-spec",
@@ -213,7 +205,7 @@ export function extractSpecForVerification(options = {}) {
   }
 
   // Fallback: parse Acceptance Criteria section from issue body or PR body
-  const fallbackSourceText = String(issueJson?.body || prJson?.body || "");
+  const fallbackSourceText = stripPipelineMarkers(issueJson?.body || prJson?.body || "");
   const fallbackTitle = String(issueJson?.title || prJson?.title || "Verify pull request changes").trim();
   const acSectionMatch = fallbackSourceText.match(
     /###\s*Acceptance\s+Criteria\s*\r?\n([\s\S]*?)(?=\r?\n###\s+|\r?\n##\s+|$)/i
@@ -468,10 +460,10 @@ export function buildFailedVerificationReviewPayload(reason, options = {}) {
   };
 }
 
-export function extractLatestVerificationFromReviews(reviewsOrTexts) {
+export function extractLatestVerificationFromReviews(reviewsOrTexts, publisherLogin = process.env.AGENT_PUBLISHER_LOGIN || "github-actions[bot]") {
   const texts = Array.isArray(reviewsOrTexts)
-    ? reviewsOrTexts.map((r) => (typeof r === "string" ? r : r?.body || ""))
-    : [typeof reviewsOrTexts === "string" ? reviewsOrTexts : ""];
+    ? reviewsOrTexts.filter((review) => isPipelinePublisher(review, publisherLogin)).map((review) => review.body || "")
+    : [];
   const combined = texts.join("\n\n");
   const regex = /<!--\s*pi:verification\s*([\s\S]*?)\s*-->/g;
   let match;
@@ -899,7 +891,13 @@ export function prepareVerificationPublish(options = {}) {
 
 export function appendFixPrTaskPromptToFile(promptFilePath, prNumber) {
   const existing = fs.existsSync(promptFilePath) ? fs.readFileSync(promptFilePath, "utf8") : "";
-  const verification = extractLatestVerificationFromReviews(existing);
+  const threadPath = path.join(path.dirname(promptFilePath), "task-pr.json");
+  const thread = JSON.parse(fs.readFileSync(threadPath, "utf8"));
+  if (String(thread.number) !== String(prNumber)) throw new Error("Fix task metadata belongs to a different PR.");
+  const verification = extractLatestVerificationFromReviews(thread.reviews || []);
+  if (!verification || verification.verdict !== "changes_needed") {
+    throw new Error("No changes-needed verification from the configured publisher; refusing a fix round.");
+  }
   const formatted = formatFixPrTaskPrompt({
     prNumber,
     prThreadText: existing,

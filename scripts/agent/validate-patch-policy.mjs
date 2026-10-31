@@ -33,7 +33,12 @@ const BUILTIN_HARD_PROTECTED_EXACT = new Set([
   ".pi/pipeline.json",
   "opencode.json",
   "opencode.jsonc",
+  ".npmrc",
 ]);
+
+export function hasTestBypass(line) {
+  return /\b(test|it|describe)\s*(?:\.\s*(skip|only|fixme|todo|skipIf|runIf)\b|\[\s*["'](skip|only|fixme|todo|skipIf|runIf)["']\s*\])/.test(line);
+}
 
 function canonicalizeScripts(pkgJsonText) {
   const parsed = JSON.parse(pkgJsonText);
@@ -81,6 +86,7 @@ export function evaluatePatchPolicy({
 
     if (
       hardProtectedExact.has(normalized) ||
+      normalized.endsWith("/.npmrc") ||
       hardProtectedPrefixes.some((prefix) => normalized === prefix.slice(0, -1) || normalized.startsWith(prefix))
     ) {
       violations.push(`Forbidden modification to protected path: ${normalized}`);
@@ -110,6 +116,10 @@ export function evaluatePatchPolicy({
     if (normalized.startsWith("tests/")) {
       labels.add("needs-test-review");
     }
+
+    if (normalized.startsWith("scripts/")) {
+      labels.add("needs-runtime-review");
+    }
   }
 
   for (const deleted of deletedFiles) {
@@ -125,8 +135,8 @@ export function evaluatePatchPolicy({
       .filter((line) => line.startsWith("+") && !line.startsWith("+++"));
 
     for (const line of addedTestLines) {
-      if (/\b(test|it|describe)\.(skip|only)\b/.test(line)) {
-        violations.push(`Forbidden test bypass (.skip or .only) added in tests/: ${line.slice(1).trim()}`);
+      if (hasTestBypass(line)) {
+        violations.push(`Forbidden test bypass (.skip/.only or equivalent) added in tests/: ${line.slice(1).trim()}`);
         break;
       }
     }

@@ -16,6 +16,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { runAgentOrThrow, setupEngines } from "./harness.mjs";
+import { isPipelinePublisher } from "./github-intake.mjs";
 
 const ALLOWED_TOP_KEYS = new Set(["status", "questions", "spec"]);
 const ALLOWED_SPEC_KEYS = new Set(["goal", "acceptanceCriteria", "outOfScope", "affectedAreas"]);
@@ -195,13 +196,13 @@ export function renderRefinementComment(result) {
 }
 
 /**
- * Extracts the latest valid refined spec from an array of issue comments (or a combined thread string).
- * If multiple `<!-- pi:refined-spec ... -->` blocks exist in the thread, the last valid one wins.
+ * Extracts the latest valid spec from the configured publisher's comments only.
+ * Flattened text has no verifiable author and cannot supply a machine marker.
  */
-export function extractRefinedSpecFromComments(commentsOrThread) {
+export function extractRefinedSpecFromComments(commentsOrThread, publisherLogin = process.env.AGENT_PUBLISHER_LOGIN || "github-actions[bot]") {
   const texts = Array.isArray(commentsOrThread)
-    ? commentsOrThread.map((c) => (typeof c === "string" ? c : c?.body || ""))
-    : [typeof commentsOrThread === "string" ? commentsOrThread : ""];
+    ? commentsOrThread.filter((comment) => isPipelinePublisher(comment, publisherLogin)).map((comment) => comment.body || "")
+    : [];
 
   const combined = texts.join("\n\n");
   const regex = /<!--\s*pi:refined-spec\s*([\s\S]*?)\s*-->/g;

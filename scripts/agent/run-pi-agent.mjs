@@ -23,6 +23,7 @@ import path from "node:path";
 import { runAgentOrThrow, setupEngines } from "./harness.mjs";
 import { runCritic } from "./run-pi-critic.mjs";
 import { loadPipelineConfig } from "./pipeline-config.mjs";
+import { getTaskChanges, resolveTaskBase } from "./git-changes.mjs";
 import {
   extractRefinedSpecFromComments,
   formatImplementerTaskWithSpec,
@@ -31,10 +32,10 @@ import {
 
 const MAX_REPAIR_ATTEMPTS = Number(process.env.MAX_REPAIR_ATTEMPTS || 3);
 
-export function runVerificationSuite(pipelineConfig = loadPipelineConfig()) {
-  const statusOutput = execSync("git status --porcelain", { encoding: "utf8" });
+export function runVerificationSuite(pipelineConfig = loadPipelineConfig(), { cwd = process.cwd(), baseRef = process.env.AGENT_BASE_SHA || "origin/main", timeoutMs = 180_000 } = {}) {
+  const { files } = getTaskChanges({ cwd, baseRef });
   const touchedUi =
-    pipelineConfig.uiPaths.some((uiPath) => statusOutput.includes(uiPath)) ||
+    files.some((file) => pipelineConfig.uiPaths.some((uiPath) => file.startsWith(uiPath))) ||
     process.env.FORCE_E2E_VERIFY === "true";
 
   const command = touchedUi ? pipelineConfig.verifyFull : pipelineConfig.verify;
@@ -44,7 +45,8 @@ export function runVerificationSuite(pipelineConfig = loadPipelineConfig()) {
     const output = execSync(command, {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
-      timeout: 180_000,
+      cwd,
+      timeout: timeoutMs,
     });
     return { ok: true, command, output };
   } catch (err) {
@@ -58,7 +60,13 @@ export function runVerificationSuite(pipelineConfig = loadPipelineConfig()) {
   }
 }
 
-function invokeImplementer({ prompt, sessionId, agentDir, sessionDir, roles, rootDir }) {
+export function remainingRunTimeout(deadline, requestedMs, now = Date.now()) {
+  const remaining = deadline - now - 5_000;
+  if (remaining <= 0) throw new Error("Agent run time budget exhausted; stopping before another attempt.");
+  return Math.min(requestedMs, remaining);
+}
+
+function invokeImplementer({ prompt, sessionId, agentDir, sessionDir, roles, rootDir, deadline }) {
   // A failed model call (API error, timeout) is not something the repair loop can fix,
   // so stop instead of re-invoking the agent with test output it never saw.
   return runAgentOrThrow({
@@ -72,7 +80,7 @@ function invokeImplementer({ prompt, sessionId, agentDir, sessionDir, roles, roo
     sessionId,
     access: "full",
     thinking: process.env.PI_THINKING_LEVEL || "high",
-    timeoutMs: 600_000,
+    timeoutMs: remainingRunTimeout(deadline, 600_000),
   }).sessionId;
 }
 
@@ -81,6 +89,7 @@ function invokeImplementer({ prompt, sessionId, agentDir, sessionDir, roles, roo
  * debugger statements, .skip/.only) or when STRICT_CRITIC makes LLM critic objections mandatory.
  */
 export function isMandatoryCriticFailure(criticVerdict, strictCritic = false) {
+  if (criticVerdict.status === "error") return true;
   if (criticVerdict.approved) return false;
   return criticVerdict.model === "deterministic-hygiene-gate" || strictCritic;
 }
@@ -118,6 +127,9 @@ export function appendCriticSectionToSummary(prSummaryPath, { primaryModel, veri
 
 export async function main() {
   const rootDir = process.cwd();
+  // Share one budget across implementation, repairs, verification and critic calls.
+  const deadline = Date.now() + 20 * 60_000;
+  const baseRef = resolveTaskBase(rootDir);
   const agentDir = path.join(rootDir, ".pi/agent");
   const sessionDir = path.join(rootDir, ".pi/sessions");
   const artifactsDir = path.join(rootDir, ".pi/artifacts");
@@ -156,7 +168,10 @@ export async function main() {
     }
   }
   if (!refinedSpec) {
-    refinedSpec = extractRefinedSpecFromComments(rawTaskPrompt);
+    const issuePath = path.join(artifactsDir, "task-issue.json");
+    if (fs.existsSync(issuePath)) {
+      refinedSpec = extractRefinedSpecFromComments(JSON.parse(fs.readFileSync(issuePath, "utf8")).comments || []);
+    }
   }
 
   const taskPrompt = formatImplementerTaskWithSpec(rawTaskPrompt, refinedSpec);
@@ -176,6 +191,7 @@ export async function main() {
       sessionDir,
       roles,
       rootDir,
+      deadline,
     });
   } else {
     console.log("[pi-runner] Dry-run mode active: skipping live LLM call, running verification & critic gates.");
@@ -194,7 +210,9 @@ export async function main() {
   }
 
   // Step 4: Bounded Local Verification & Self-Repair Loop
-  let verification = runVerificationSuite(pipelineConfig);
+  const verify = () => runVerificationSuite(pipelineConfig, { baseRef, timeoutMs: remainingRunTimeout(deadline, 180_000) });
+  const critic = () => runCritic({ taskSpec: taskPrompt, testOutput: verification.output, dryRun, baseRef, timeoutMs: remainingRunTimeout(deadline, 180_000) });
+  let verification = verify();
   let attempt = 1;
 
   while (!verification.ok && attempt <= MAX_REPAIR_ATTEMPTS && !dryRun) {
@@ -215,9 +233,10 @@ export async function main() {
       sessionDir,
       roles,
       rootDir,
+      deadline,
     });
 
-    verification = runVerificationSuite(pipelineConfig);
+    verification = verify();
     attempt++;
   }
 
@@ -228,11 +247,8 @@ export async function main() {
 
   // Step 5: Critic Check (Deterministic hygiene + optional cross-model review)
   console.log("[pi-runner] Step 5: Running Critic check...");
-  let criticVerdict = runCritic({
-    taskSpec: taskPrompt,
-    testOutput: verification.output,
-    dryRun,
-  });
+  let criticVerdict = critic();
+  if (criticVerdict.status === "error") throw new Error(criticVerdict.summary);
 
   const strictCritic = process.env.STRICT_CRITIC === "true";
 
@@ -252,17 +268,15 @@ export async function main() {
       sessionDir,
       roles,
       rootDir,
+      deadline,
     });
 
-    verification = runVerificationSuite(pipelineConfig);
+    verification = verify();
     if (!verification.ok) {
       throw new Error(`Verification failed after critic pass:\n${verification.output}`);
     }
-    criticVerdict = runCritic({
-      taskSpec: taskPrompt,
-      testOutput: verification.output,
-      dryRun,
-    });
+    criticVerdict = critic();
+    if (criticVerdict.status === "error") throw new Error(criticVerdict.summary);
     // The repair pass gets one chance; publishing a diff that still fails mandatory checks is not allowed
     if (isMandatoryCriticFailure(criticVerdict, strictCritic)) {
       const unresolved = (criticVerdict.issues || []).map((issue) => `- ${issue}`).join("\n");
