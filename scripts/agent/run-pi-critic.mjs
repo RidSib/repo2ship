@@ -11,11 +11,12 @@
  *    Otherwise skips duplicate same-model token spend and reports deterministic status.
  */
 
-import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { runAgent, setupEngines } from "./harness.mjs";
 import { hasModelApiKey } from "./model-config.mjs";
+import { getTaskChanges } from "./git-changes.mjs";
+import { hasTestBypass } from "./validate-patch-policy.mjs";
 
 export function runDeterministicDiffChecks(diffText) {
   const issues = [];
@@ -31,32 +32,29 @@ export function runDeterministicDiffChecks(diffText) {
   if (addedLines.some((line) => /\bdebugger\b/.test(line))) {
     issues.push("Leftover `debugger` statement detected in diff.");
   }
-  if (addedLines.some((line) => /\b(test|it|describe)\.(skip|only)\b/.test(line))) {
-    issues.push("Test bypass (`.skip` or `.only`) detected in diff.");
+  if (addedLines.some(hasTestBypass)) {
+    issues.push("Test bypass (`.skip`/`.only` or equivalent) detected in diff.");
   }
 
   return issues;
 }
 
-function getFullWorkingTreeDiff() {
+export function parseCriticVerdict(result, model) {
   try {
-    // Stage untracked files with intent-to-add (-N) so new file contents appear in git diff
-    execSync("git add -N .", { stdio: "ignore" });
-  } catch {
-    // Ignore if not in a git repo
-  }
-
-  try {
-    return execSync("git diff HEAD -- . ':(exclude).pi'", {
-      encoding: "utf8",
-      maxBuffer: 10 * 1024 * 1024,
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
-  } catch {
-    return execSync("git diff -- . ':(exclude).pi'", {
-      encoding: "utf8",
-      maxBuffer: 10 * 1024 * 1024,
-    }).trim();
+    if (!result.ok) throw new Error(result.error || "Critic process failed.");
+    const match = (result.text || "").match(/\{[\s\S]*\}/);
+    if (!match) throw new Error("Critic returned no JSON verdict.");
+    const parsed = JSON.parse(match[0]);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) ||
+        Object.keys(parsed).some((key) => !["approved", "summary", "issues"].includes(key)) ||
+        typeof parsed.approved !== "boolean" || typeof parsed.summary !== "string" || !parsed.summary.trim() ||
+        !Array.isArray(parsed.issues) || parsed.issues.some((issue) => typeof issue !== "string" || !issue.trim()) ||
+        (parsed.approved && parsed.issues.length > 0) || (!parsed.approved && parsed.issues.length === 0)) {
+      throw new Error("Critic returned an invalid or contradictory verdict.");
+    }
+    return { ...parsed, model, status: parsed.approved ? "approved" : "rejected" };
+  } catch (err) {
+    return { approved: false, model, status: "error", summary: `Critic review failed: ${err.message}`, issues: [] };
   }
 }
 
@@ -64,6 +62,8 @@ export function runCritic({
   taskSpec = process.env.AGENT_TASK_PROMPT || "Verify changes match repository quality standards.",
   testOutput = "All local verification checks passed.",
   dryRun = process.argv.includes("--dry-run") || !hasModelApiKey(process.env),
+  baseRef = process.env.AGENT_BASE_SHA || "origin/main",
+  timeoutMs = 180_000,
 } = {}) {
   const rootDir = process.cwd();
   const artifactsDir = path.join(rootDir, ".pi/artifacts");
@@ -75,7 +75,7 @@ export function runCritic({
   const { roles } = setupEngines({ agentDir });
   const implementerModel = roles.implementer.model;
   const strategistModel = roles.strategist.model;
-  const gitDiff = getFullWorkingTreeDiff();
+  const gitDiff = getTaskChanges({ baseRef }).diff;
 
   const deterministicIssues = runDeterministicDiffChecks(gitDiff);
   if (deterministicIssues.length > 0) {
@@ -139,33 +139,10 @@ export function runCritic({
     agentDir,
     sessionDir,
     access: "read-only",
-    timeoutMs: 180_000,
+    timeoutMs,
   });
 
-  let verdict = {
-    approved: true,
-    model: strategistModel,
-    summary: "Cross-model critic review completed.",
-    issues: [],
-  };
-
-  const rawOutput = (result.text || "").trim();
-  const jsonMatch = rawOutput.match(/\{[\s\S]*\}/);
-  if (jsonMatch) {
-    try {
-      const parsed = JSON.parse(jsonMatch[0]);
-      verdict = {
-        approved: Boolean(parsed.approved),
-        model: strategistModel,
-        summary: String(parsed.summary || ""),
-        issues: Array.isArray(parsed.issues) ? parsed.issues.map(String) : [],
-      };
-    } catch {
-      verdict.summary = rawOutput.slice(0, 500);
-    }
-  } else if (!result.ok) {
-    verdict.summary = `Critic run failed (${result.error}); falling back to deterministic verification.`;
-  }
+  const verdict = parseCriticVerdict(result, strategistModel);
 
   fs.writeFileSync(path.join(artifactsDir, "critic-verdict.json"), JSON.stringify(verdict, null, 2) + "\n", "utf8");
   return verdict;

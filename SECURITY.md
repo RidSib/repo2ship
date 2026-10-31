@@ -12,6 +12,10 @@ Repo2Ship runs generated commands, dependency installation, project tests, and a
 
 Model-running steps can access their model credentials and job permissions. Environment filtering removes configured credentials from the verifier's app process, but does not isolate the filesystem, dependency lifecycle scripts, or other processes in the job. Use dedicated, least-privilege model credentials and provider spending controls. An AWS OIDC-enabled job can request AWS credentials; restrict its role accordingly.
 
+Copying trusted scripts from `main` does not make them immutable: PR code and dependencies run as the same runner user and could modify verifier or telemetry tooling, replace locally resolved engine binaries, or forge result artifacts. Independent model review is not an execution-isolated security verdict. These workflows remain intended for trusted maintainers and dependencies.
+
+Task intake retains instruction comments only from current write collaborators and the configured `AGENT_PUBLISHER_LOGIN`. Only that publisher's authored comments/reviews can supply machine spec or verifier markers; issue/PR bodies and quoted markers cannot. Set the exact publisher login when using a GitHub App or PAT. The issue/PR description itself is still external content selected by the authorized trigger, not a guarantee against prompt injection.
+
 Only collaborators with write access should trigger agent work. Policy checks and an independent verifier reduce risk but cannot prove generated code is safe. Keep branch protection, code-owner review, and human review enabled. Do not adapt these workflows to execute arbitrary fork code with secrets.
 
 ## Merge behavior

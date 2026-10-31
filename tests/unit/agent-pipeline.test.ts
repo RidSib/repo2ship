@@ -2,7 +2,7 @@ import { execSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   completionsSettingsFor,
   hasModelApiKey,
@@ -57,6 +57,9 @@ import {
   validateVerificationResult,
   withoutSecrets,
 } from "../../scripts/agent/verification.mjs";
+
+beforeEach(() => vi.stubEnv("AGENT_PUBLISHER_LOGIN", "github-actions[bot]"));
+afterEach(() => vi.unstubAllEnvs());
 
 describe("Autonomous Agent Pipeline Scripts", () => {
   it("normalizes Azure OpenAI and Microsoft Foundry URLs to /openai/v1", () => {
@@ -872,12 +875,12 @@ describe("Autonomous Agent Pipeline Scripts", () => {
     });
     const readyMd2 = renderRefinementComment(updatedReady);
 
-    // Latest refined spec in an issue comment thread wins
+    // Latest refined spec from the designated publisher wins
     const extracted = extractRefinedSpecFromComments([
-      { body: clarifyMd },
-      { body: readyMd1 },
+      { author: { login: "github-actions[bot]" }, body: clarifyMd },
+      { author: { login: "github-actions[bot]" }, body: readyMd1 },
       { body: "@pi actually please use the updated spec" },
-      { body: readyMd2 },
+      { author: { login: "github-actions[bot]" }, body: readyMd2 },
     ]);
     expect(extracted).toEqual(updatedReady.spec);
 
@@ -1020,6 +1023,10 @@ describe("Autonomous Agent Pipeline Scripts", () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fix-prompt-test-"));
     const promptFile = path.join(tmpDir, "task-prompt.txt");
     fs.writeFileSync(promptFile, `# Pull request #9: Add Reopen button\n\n${reviewPayload.body}\n`, "utf8");
+    fs.writeFileSync(path.join(tmpDir, "task-pr.json"), JSON.stringify({
+      number: 9,
+      reviews: [{ author: { login: "github-actions[bot]" }, body: reviewPayload.body }],
+    }));
     const updatedPrompt = appendFixPrTaskPromptToFile(promptFile, "9");
     expect(updatedPrompt).toContain("## 🔧 Mandatory Verifier Fix Task (PR #9)");
     expect(updatedPrompt).toContain("- **AC-2** (`fail`): Footer completed count stayed at 1 after Reopen.");
@@ -1056,7 +1063,7 @@ describe("Autonomous Agent Pipeline Scripts", () => {
       issueJson: {
         title: "Raw issue title",
         body: "Raw body",
-        comments: [{ body: refinedComment }],
+        comments: [{ author: { login: "github-actions[bot]" }, body: refinedComment }],
       },
     });
     expect(fromMarker.source).toBe("refined-spec");

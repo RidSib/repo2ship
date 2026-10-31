@@ -4,6 +4,13 @@ Notable changes are recorded here for each release. Versions follow [Semantic Ve
 
 ## [Unreleased]
 
+### Fixed
+
+- Authenticate task comment authors and machine-marker publishers before using refinement or verifier feedback; retain author metadata for fix rounds.
+- Include committed changes in UI verification and critic review, and stop publication when an enabled critic fails or returns an invalid verdict.
+- Recheck policy on the exact PR commit before verifier dependency installation; protect npm configuration, detect additional test bypasses, and require review of project scripts.
+- Share a bounded execution deadline across implementation and repair calls, and report successful runs that produce no patch.
+
 ## [0.1.0] - 2026-10-26
 
 ### Added

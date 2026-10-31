@@ -31,6 +31,9 @@ on:
         default: ""
         type: string
 
+env:
+  AGENT_PUBLISHER_LOGIN: ${{ vars.AGENT_PUBLISHER_LOGIN || 'github-actions[bot]' }}
+
 jobs:
   # ==========================================================================
   # JOB 0: Stage 2 Refinement Agent (Strategist Role, Read-Only Repo Token)
@@ -106,9 +109,7 @@ jobs:
           ISSUE_NUM="${EVENT_ISSUE_NUM:-$INPUT_ISSUE}"
           echo "issue_number=${ISSUE_NUM}" >> "$GITHUB_OUTPUT"
 
-          gh issue view "$ISSUE_NUM" --json number,title,body,comments --jq '
-            "# Issue #\(.number): \(.title)\n\n\(.body)\n"
-            + (.comments | map("\n---\n@\(.author.login) commented:\n\(.body)\n") | join(""))' > .pi/artifacts/task-prompt.txt
+          node scripts/agent/github-intake.mjs issue "$ISSUE_NUM" .pi/artifacts
 
       - name: Run Strategist Refinement Agent
         id: refine_run
@@ -358,29 +359,20 @@ jobs:
           echo "rebase_failed=false" >> "$GITHUB_OUTPUT"
 
           PROMPT_FILE=".pi/artifacts/task-prompt.txt"
+          # Branch contents must not supply stale task metadata or a refined spec.
+          rm -f .pi/artifacts/refinement.json .pi/artifacts/task-issue.json .pi/artifacts/task-pr.json
           if [ -n "$INPUT_PROMPT" ]; then
             printf "%s\n" "$INPUT_PROMPT" > "$PROMPT_FILE"
           elif [ -n "$PR_TARGET_NUM" ]; then
-            gh pr view "$PR_TARGET_NUM" --json number,title,body,comments,reviews --jq '
-              "# Pull request #\(.number): \(.title)\n\n\(.body)\n"
-              + (.comments | map("\n---\n@\(.author.login) commented:\n\(.body)\n") | join(""))
-              + (.reviews | map(select(.body != "") | "\n---\n@\(.author.login) reviewed (\(.state)):\n\(.body)\n") | join(""))' > "$PROMPT_FILE"
-            gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_TARGET_NUM}/comments" --paginate --jq '
-              .[] | "\n---\n@\(.user.login) on `\(.path)`:\n\(.body)\n"' >> "$PROMPT_FILE"
+            node /tmp/agent-scripts/github-intake.mjs pr "$PR_TARGET_NUM" .pi/artifacts
             if [[ "$ISSUE_NUM" =~ ^[0-9]+$ ]] && [ "$ISSUE_NUM" != "$PR_TARGET_NUM" ]; then
-              gh issue view "$ISSUE_NUM" --json number,title,body,comments --jq '
-                "\n---\n# Linked Issue #\(.number): \(.title)\n\n\(.body)\n"
-                + (.comments | map("\n---\n@\(.author.login) commented on issue:\n\(.body)\n") | join(""))' >> "$PROMPT_FILE" 2>/dev/null || true
+              node /tmp/agent-scripts/github-intake.mjs issue "$ISSUE_NUM" .pi/artifacts --append
             fi
             if [ -n "$INPUT_FIX_PR" ]; then
               PROMPT_FILE="$PROMPT_FILE" INPUT_FIX_PR="$INPUT_FIX_PR" node /tmp/agent-scripts/verification.mjs --prepare-fix-prompt
             fi
           elif [[ "$ISSUE_NUM" =~ ^[0-9]+$ ]]; then
-            # Use --json: in non-interactive mode `gh issue view --comments` prints only the
-            # comments, so the issue title and body never reached the agent.
-            gh issue view "$ISSUE_NUM" --json number,title,body,comments --jq '
-              "# Issue #\(.number): \(.title)\n\n\(.body)\n"
-              + (.comments | map("\n---\n@\(.author.login) commented:\n\(.body)\n") | join(""))' > "$PROMPT_FILE"
+            node /tmp/agent-scripts/github-intake.mjs issue "$ISSUE_NUM" .pi/artifacts
           else
             echo "Run repository verification and fix any failing checks." > "$PROMPT_FILE"
           fi
@@ -432,6 +424,7 @@ jobs:
           AZURE_OPENAI_API: ${{ vars.AZURE_OPENAI_API || '' }}
           AZURE_MODEL_COMPAT: ${{ vars.AZURE_MODEL_COMPAT || '' }}
           ENABLE_CRITIC: ${{ vars.ENABLE_CRITIC || 'false' }}
+          STRICT_CRITIC: ${{ vars.STRICT_CRITIC || 'false' }}
           PI_THINKING_LEVEL: ${{ vars.PI_THINKING_LEVEL || 'high' }}
           MODEL_COST_INPUT_PER_1M: ${{ vars.MODEL_COST_INPUT_PER_1M || '' }}
           MODEL_COST_OUTPUT_PER_1M: ${{ vars.MODEL_COST_OUTPUT_PER_1M || '' }}
@@ -597,6 +590,18 @@ jobs:
             gh issue comment "$ISSUE_NUM" --body-file .pi/artifacts/clarification-needed.md || gh pr comment "$ISSUE_NUM" --body-file .pi/artifacts/clarification-needed.md
           fi
           echo "Paused waiting for human reply on Issue/PR #${ISSUE_NUM}."
+
+      - name: Report a successful run with no patch
+        if: needs.agent.result == 'success' && needs.agent.outputs.has_patch == 'false' && needs.agent.outputs.rebase_failed != 'true' && needs.agent.outputs.clarification_needed != 'true'
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token || secrets.AGENT_PAT || secrets.GITHUB_TOKEN }}
+          ISSUE_NUM: ${{ needs.agent.outputs.issue_number }}
+        run: |
+          MESSAGE="Repo2Ship finished verification but produced no code changes. No PR was opened. Review the run logs before retrying."
+          echo "$MESSAGE" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$ISSUE_NUM" =~ ^[0-9]+$ ]]; then
+            gh issue comment "$ISSUE_NUM" --body "$MESSAGE"
+          fi
 
       - name: Validate Patch Policy (6-Row Matrix) & Publish Pull Request
         id: publish
@@ -809,14 +814,15 @@ jobs:
           fi
 
           if [[ "$ISSUE_NUM" =~ ^[0-9]+$ ]]; then
-            gh issue view "$ISSUE_NUM" --json number,title,body,comments > /tmp/verify-meta/verify-issue.json 2>/dev/null || true
+            if node /tmp/agent-scripts/github-intake.mjs issue "$ISSUE_NUM" /tmp/verify-meta; then
+              mv /tmp/verify-meta/task-issue.json /tmp/verify-meta/verify-issue.json
+            fi
           fi
 
-          if git rev-parse --verify --quiet "refs/remotes/origin/${HEAD_REF}" >/dev/null; then
-            git checkout --detach "refs/remotes/origin/${HEAD_REF}"
-          else
-            git checkout --detach "$HEAD_OID"
-          fi
+          # Check the exact API-selected commit, including manual verify_pr runs,
+          # before npm or any other PR-controlled executable is invoked.
+          git checkout --detach "$HEAD_OID"
+          BASE_REF=origin/main POLICY_OUTPUT=/tmp/verifier-policy.json node /tmp/agent-scripts/validate-patch-policy.mjs
 
           mkdir -p .pi/artifacts .pi/sessions .pi/qa
           cp /tmp/verify-meta/*.json .pi/artifacts/
